@@ -1,6 +1,6 @@
 fastapi
 uvicorn
 gunicorn
-tensorflow
+tensorflow-cpu==2.13.0
 pillow
 python-multipart
