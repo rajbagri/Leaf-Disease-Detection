@@ -5,15 +5,23 @@ from PIL import Image
 import io
 import importlib.util
 import sys
+import kagglehub
 
 app = FastAPI()
 
-# ===== PATHS =====
-MODEL_FILE = r"C:\Users\hp\.cache\kagglehub\models\khanaamer\leaf-disease-detection-using-cnn-and-vit\tensorFlow2\default\1\saved_models\vit_dataset-1.h5"
+# ===== DOWNLOAD MODEL ON STARTUP (works in Docker + Render) =====
+print("Downloading model from KaggleHub...")
 
-CUSTOM_LAYER_FILE = r"C:\Users\hp\.cache\kagglehub\models\khanaamer\leaf-disease-detection-using-cnn-and-vit\tensorFlow2\default\1\Models\cnn_vit_model.py"
+MODEL_BASE_PATH = kagglehub.model_download(
+    "khanaamer/leaf-disease-detection-using-cnn-and-vit/tensorFlow2/default"
+)
 
-# ===== DYNAMIC LOAD OF CUSTOM LAYERS =====
+CUSTOM_LAYER_FILE = MODEL_BASE_PATH + "/Models/cnn_vit_model.py"
+MODEL_FILE = MODEL_BASE_PATH + "/saved_models/vit_dataset-1.h5"
+
+print("Model files downloaded to:", MODEL_BASE_PATH)
+
+# ===== LOAD CUSTOM LAYER DYNAMICALLY =====
 spec = importlib.util.spec_from_file_location("cnn_vit_model", CUSTOM_LAYER_FILE)
 cnn_vit = importlib.util.module_from_spec(spec)
 sys.modules["cnn_vit_model"] = cnn_vit
@@ -21,18 +29,18 @@ spec.loader.exec_module(cnn_vit)
 
 TransformerBlock = cnn_vit.TransformerBlock
 
-# ===== LOAD MODEL (<<< IMPORTANT CHANGE HERE) =====
+# ===== LOAD MODEL (INFERENCE ONLY) =====
 with tf.keras.utils.custom_object_scope({
     "TransformerBlock": TransformerBlock
 }):
-    model = tf.keras.models.load_model(MODEL_FILE, compile=False)  # <-- FIX
+    model = tf.keras.models.load_model(MODEL_FILE, compile=False)
 
 print("Model Loaded Successfully!")
 
 # ===== PREPROCESS IMAGE =====
 def preprocess_image(image_bytes):
     image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    image = image.resize((256, 256))   # <-- FIXED (was 224)
+    image = image.resize((256, 256))   # Model expects 256x256
     image = np.array(image) / 255.0
     image = np.expand_dims(image, axis=0)
     return image
@@ -61,12 +69,8 @@ async def predict(file: UploadFile = File(...)):
         }
 
     except Exception as e:
-        return {
-            "error": str(e)
-        }
-
+        return {"error": str(e)}
 
 @app.get("/ping")
 def ping():
     return {"message": "server is alive"}
-

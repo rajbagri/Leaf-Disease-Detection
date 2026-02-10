@@ -4,3 +4,4 @@ gunicorn
 tensorflow==2.13.0
 pillow
 python-multipart
+kagglehub
