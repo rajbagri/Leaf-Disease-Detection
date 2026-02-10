@@ -6,20 +6,34 @@ import io
 import importlib.util
 import sys
 import kagglehub
+import os
 
 app = FastAPI()
 
-# ===== DOWNLOAD MODEL ON STARTUP (works in Docker + Render) =====
+# ===== DOWNLOAD MODEL ON STARTUP =====
 print("Downloading model from KaggleHub...")
 
 MODEL_BASE_PATH = kagglehub.model_download(
     "khanaamer/leaf-disease-detection-using-cnn-and-vit/tensorFlow2/default"
 )
 
-CUSTOM_LAYER_FILE = MODEL_BASE_PATH + "/Models/cnn_vit_model.py"
-MODEL_FILE = MODEL_BASE_PATH + "/saved_models/vit_dataset-1.h5"
+print("Model downloaded to:", MODEL_BASE_PATH)
 
-print("Model files downloaded to:", MODEL_BASE_PATH)
+# ===== FIND FILES AUTOMATICALLY (IMPORTANT FIX) =====
+def find_file(base_path, filename):
+    for root, dirs, files in os.walk(base_path):
+        if filename in files:
+            return os.path.join(root, filename)
+    return None
+
+CUSTOM_LAYER_FILE = find_file(MODEL_BASE_PATH, "cnn_vit_model.py")
+MODEL_FILE = find_file(MODEL_BASE_PATH, "vit_dataset-1.h5")
+
+print("Custom layer file:", CUSTOM_LAYER_FILE)
+print("Model file:", MODEL_FILE)
+
+if CUSTOM_LAYER_FILE is None or MODEL_FILE is None:
+    raise FileNotFoundError("Could not locate model files in downloaded archive")
 
 # ===== LOAD CUSTOM LAYER DYNAMICALLY =====
 spec = importlib.util.spec_from_file_location("cnn_vit_model", CUSTOM_LAYER_FILE)
