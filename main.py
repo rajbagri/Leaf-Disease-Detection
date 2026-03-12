@@ -1,7 +1,7 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 import onnxruntime as ort
 import numpy as np
-from PIL import Image, ImageFilter, ImageEnhance
+from PIL import Image
 import cv2
 import io
 import asyncio
@@ -41,43 +41,24 @@ CLASSES = [
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  STEP 1 — Image Quality Validation
+#  STEP 1 — Basic Image Validation (non-destructive checks only)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def validate_image_quality(img_array: np.ndarray) -> dict:
+def validate_image(img_array: np.ndarray) -> dict:
 
     gray = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
 
-    # Blur — relaxed from 50 to 8
-    # Real phone camera leaf photos often score 10-30
+    # Blur — only reject extremely blurry images
     blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
-    if blur_score < 8:
-        return {
-            "valid":  False,
-            "reason": "Image is too blurry. Please upload a clearer photo.",
-        }
+    if blur_score < 5:
+        return {"valid": False, "reason": "Image is too blurry. Please upload a clearer photo."}
 
-    # Brightness — relaxed: dark from 30→15, bright from 230→245
-    # Outdoor leaf photos can be quite dark or washed out
+    # Brightness — only reject completely dark or completely white images
     brightness = gray.mean()
-    if brightness < 15:
-        return {
-            "valid":  False,
-            "reason": "Image is too dark. Please upload a well-lit photo.",
-        }
-    if brightness > 245:
-        return {
-            "valid":  False,
-            "reason": "Image is too bright / overexposed. Please upload a better photo.",
-        }
-
-    # Contrast — relaxed from 15 to 5
-    contrast = gray.std()
-    if contrast < 5:
-        return {
-            "valid":  False,
-            "reason": "Image has very low contrast. Please upload a clearer photo.",
-        }
+    if brightness < 10:
+        return {"valid": False, "reason": "Image is too dark. Please upload a well-lit photo."}
+    if brightness > 250:
+        return {"valid": False, "reason": "Image is completely overexposed. Please upload a better photo."}
 
     return {
         "valid":      True,
@@ -87,7 +68,7 @@ def validate_image_quality(img_array: np.ndarray) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  STEP 2 — Leaf Validation (reject non-leaf images)
+#  STEP 2 — Leaf Detection (very relaxed — just reject obvious non-leaves)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def validate_is_leaf(img_array: np.ndarray) -> dict:
@@ -98,108 +79,34 @@ def validate_is_leaf(img_array: np.ndarray) -> dict:
 
     hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
 
-    # Widened green range — covers more leaf shades
-    green_mask = cv2.inRange(hsv, np.array([15, 10, 10]),  np.array([110, 255, 255]))
+    # Very wide range — covers green, yellow, brown, red (all leaf states)
+    green_mask = cv2.inRange(hsv, np.array([10, 10, 10]), np.array([110, 255, 255]))
+    brown_mask = cv2.inRange(hsv, np.array([3,  10, 10]), np.array([30,  255, 230]))
+    red_mask1  = cv2.inRange(hsv, np.array([0,  10, 10]), np.array([3,   255, 230]))
+    red_mask2  = cv2.inRange(hsv, np.array([170,10, 10]), np.array([180, 255, 230]))
 
-    # Widened brown/yellow range — covers heavily diseased leaves
-    brown_mask = cv2.inRange(hsv, np.array([3,  10, 10]),  np.array([30,  255, 220]))
+    combined      = cv2.bitwise_or(cv2.bitwise_or(green_mask, brown_mask),
+                                   cv2.bitwise_or(red_mask1,  red_mask2))
+    leaf_coverage = np.sum(combined > 0) / total_pixels
 
-    # Red range — some diseased leaves turn red
-    red_mask1  = cv2.inRange(hsv, np.array([0,  10, 10]),  np.array([3,   255, 220]))
-    red_mask2  = cv2.inRange(hsv, np.array([170,10, 10]),  np.array([180, 255, 220]))
-
-    combined_mask = cv2.bitwise_or(green_mask, brown_mask)
-    combined_mask = cv2.bitwise_or(combined_mask, red_mask1)
-    combined_mask = cv2.bitwise_or(combined_mask, red_mask2)
-
-    leaf_coverage = np.sum(combined_mask > 0) / total_pixels
-
-    # Relaxed: both need to fail (AND) and thresholds lowered from 0.10 to 0.05
-    if green_ratio < 0.05 and leaf_coverage < 0.05:
+    # Very relaxed — only reject if both checks clearly fail
+    if green_ratio < 0.03 and leaf_coverage < 0.03:
         return {
             "valid":  False,
-            "reason": "No leaf detected in the image. Please upload a clear photo of a plant leaf.",
+            "reason": "No leaf detected. Please upload a clear photo of a plant leaf.",
         }
 
     return {"valid": True, "leaf_coverage": round(float(leaf_coverage), 2)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  STEP 3 — Leaf Segmentation (GrabCut — isolate leaf, remove background)
+#  STEP 3 — Preprocess exactly as model was trained (resize + /255.0 only)
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def segment_leaf(img_array: np.ndarray) -> np.ndarray:
-
-    try:
-        img_bgr   = cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR)
-        h, w      = img_bgr.shape[:2]
-        mask      = np.zeros((h, w), np.uint8)
-        rect      = (w // 8, h // 8, w * 6 // 8, h * 6 // 8)
-        bgd_model = np.zeros((1, 65), np.float64)
-        fgd_model = np.zeros((1, 65), np.float64)
-
-        cv2.grabCut(img_bgr, mask, rect, bgd_model, fgd_model, 3, cv2.GC_INIT_WITH_RECT)
-
-        final_mask = np.where(
-            (mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0
-        ).astype(np.uint8)
-
-        # Relaxed: skip only if mask is less than 3% (was 5%)
-        if final_mask.sum() < (h * w * 0.03):
-            return img_array
-
-        segmented = img_bgr.copy()
-        segmented[final_mask == 0] = [255, 255, 255]
-
-        return cv2.cvtColor(segmented, cv2.COLOR_BGR2RGB)
-
-    except Exception:
-        return img_array
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  STEP 4 — Auto Enhancement (CLAHE + denoising + sharpening + saturation)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def enhance_image(img: Image.Image) -> Image.Image:
-
-    img_array = np.array(img)
-
-    # CLAHE on L channel in LAB color space
-    lab          = cv2.cvtColor(img_array, cv2.COLOR_RGB2LAB)
-    l, a, b      = cv2.split(lab)
-    clahe        = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    lab_enhanced = cv2.merge([clahe.apply(l), a, b])
-    img_array    = cv2.cvtColor(lab_enhanced, cv2.COLOR_LAB2RGB)
-
-    # Fast denoising
-    img_array = cv2.fastNlMeansDenoisingColored(
-        img_array, None,
-        h=5, hColor=5,
-        templateWindowSize=7,
-        searchWindowSize=21,
-    )
-
-    img = Image.fromarray(img_array)
-
-    # Unsharp mask sharpening
-    img = img.filter(ImageFilter.UnsharpMask(radius=1.5, percent=120, threshold=3))
-
-    # Saturation boost
-    img = ImageEnhance.Color(img).enhance(1.2)
-
-    return img
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  STEP 5 — Normalize
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def normalize(img: Image.Image) -> np.ndarray:
-
+def preprocess(img: Image.Image) -> np.ndarray:
     img = img.resize((256, 256), Image.LANCZOS)
     arr = np.array(img, dtype=np.float32) / 255.0
-    return np.expand_dims(arr, axis=0)
+    return np.expand_dims(arr, axis=0)  # shape: (1, 256, 256, 3)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -215,25 +122,18 @@ def full_preprocess(image_bytes: bytes) -> tuple:
 
     img_array = np.array(img)
 
-    # 1. Quality validation
-    quality = validate_image_quality(img_array)
+    # 1. Basic quality validation
+    quality = validate_image(img_array)
     if not quality["valid"]:
         raise HTTPException(status_code=400, detail=quality["reason"])
 
-    # 2. Leaf validation
+    # 2. Leaf check
     leaf_check = validate_is_leaf(img_array)
     if not leaf_check["valid"]:
         raise HTTPException(status_code=400, detail=leaf_check["reason"])
 
-    # 3. Segmentation
-    img_array = segment_leaf(img_array)
-    img       = Image.fromarray(img_array)
-
-    # 4. Enhancement
-    img = enhance_image(img)
-
-    # 5. Normalize
-    model_input = normalize(img)
+    # 3. Preprocess — NO segmentation, NO enhancement, just resize + normalize
+    model_input = preprocess(img)
 
     metadata = {
         "blur_score":    quality.get("blur_score"),
