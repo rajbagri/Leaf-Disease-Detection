@@ -15,7 +15,7 @@ _executor = ThreadPoolExecutor(max_workers=6)
 
 # ── Load rembg session once (reuse across requests — avoids reload overhead) ──
 print("Loading rembg model...")
-rembg_session = new_session("u2net")
+rembg_session = new_session("u2netp")
 print("rembg ready.")
 
 # ── Load ONNX model ───────────────────────────────────────────────────────────
@@ -112,12 +112,12 @@ def validate_is_leaf(img_array: np.ndarray) -> dict:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  STEP 3 — Background Removal (rembg u2net)
+#  STEP 3 — Background Removal (rembg u2netp)
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def remove_background(img: Image.Image) -> Image.Image:
     """
-    Uses rembg u2net to remove background.
+    Uses rembg u2netp to remove background.
     Transparent pixels → white (255,255,255) so model sees neutral background.
     Colors of leaf pixels are NOT changed.
     Falls back to original if rembg fails.

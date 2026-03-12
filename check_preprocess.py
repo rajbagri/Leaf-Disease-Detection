@@ -126,8 +126,8 @@ if not leaf_check["valid"]:
 print(f"   Result: PASSED")
 
 # ── Step 3: Background removal ────────────────────────────────────────────────
-print(f"\n⏳ Stage 4 — Background Removal (rembg u2net) — loading model...")
-rembg_session = new_session("u2net")
+print(f"\n⏳ Stage 4 — Background Removal (rembg u2netp) — loading model...")
+rembg_session = new_session("u2netp")
 img_no_bg     = remove_background(img, rembg_session)
 img_no_bg.save("debug_output/stage4_background_removed.jpg")
 print(f"✅ Stage 4 — Background Removed")
