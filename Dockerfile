@@ -24,5 +24,5 @@ COPY model.onnx .
 EXPOSE 8000
 
 # 6 workers — safe for 512MB RAM with ONNX Runtime (~4.4MB model)
-CMD ["gunicorn", "-w", "6", "-k", "uvicorn.workers.UvicornWorker", \
+CMD ["gunicorn", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", \
      "--timeout", "120", "--bind", "0.0.0.0:8000", "main:app"]
