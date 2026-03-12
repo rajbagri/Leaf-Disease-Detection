@@ -2,7 +2,6 @@ FROM python:3.10-slim
 
 WORKDIR /app
 
-# System deps for OpenCV headless
 RUN apt-get update && apt-get install -y \
     libgomp1 \
     libglib2.0-0 \
@@ -11,18 +10,27 @@ RUN apt-get update && apt-get install -y \
     libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN python -c "from rembg import new_session; new_session('u2net'); print('rembg u2net model downloaded.')"
+# Pre-download u2netp model and store in a known location inside the image
+# U2NET_HOME tells rembg exactly where to save/look for the model
+ENV U2NET_HOME=/app/u2net_models
 
-# Copy app and model
+RUN python -c "\
+import os; \
+os.environ['U2NET_HOME'] = '/app/u2net_models'; \
+os.makedirs('/app/u2net_models', exist_ok=True); \
+from rembg import new_session; \
+new_session('u2netp'); \
+print('u2netp downloaded to /app/u2net_models'); \
+import os; files = os.listdir('/app/u2net_models'); \
+print('Files:', files)"
+
 COPY main.py .
 COPY model.onnx .
 
 EXPOSE 8000
 
-# 2 workers — safe for 512MB RAM with rembg + onnx loaded
 CMD ["gunicorn", "-w", "2", "-k", "uvicorn.workers.UvicornWorker", \
      "--timeout", "120", "--bind", "0.0.0.0:8000", "main:app"]
