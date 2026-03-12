@@ -1,7 +1,8 @@
-fastapi
-uvicorn
-gunicorn
-tensorflow==2.13.0
-pillow
-python-multipart
-kagglehub
+fastapi==0.111.0
+uvicorn==0.29.0
+gunicorn==22.0.0
+onnxruntime==1.18.0
+numpy==1.26.4
+Pillow==10.3.0
+opencv-python-headless==4.9.0.80
+python-multipart==0.0.9
