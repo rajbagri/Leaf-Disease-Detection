@@ -1,204 +1,196 @@
 """
-Leaf Disease Image Preprocessing Pipeline
-------------------------------------------
-This script preprocesses a leaf image through a series of stages before
-passing it to a disease classification model. The pipeline includes:
-    1. Loading the original image
-    2. Validating image quality (blur, brightness, leaf coverage)
-    3. Sharpening mildly blurry images (if needed)
-    4. Removing the background (isolating the leaf)
-    5. Reducing noise
-    6. Resizing and normalizing for model input
+Leaf Disease Detection API
+--------------------------
+A FastAPI application that accepts a leaf image, runs it through a
+multi-stage preprocessing pipeline, and returns a disease classification
+using a pre-converted ONNX model.
 
-All intermediate outputs are saved to the 'debug_output/' directory for inspection.
+Endpoints:
+    POST /predict  -- Upload a leaf image; returns disease label and confidence
+    GET  /ping     -- Health check
 """
 
-from PIL import Image
-import numpy as np
-import cv2
 import os
 
-# Path to the input leaf image
-IMAGE_PATH = "Algal-Leaf-Spot-Symptoms.jpg"
+# Limit CPU thread usage to 1 per library to prevent thread over-subscription
+# on low-resource containers (e.g. Render free tier). Without this, ONNX Runtime
+# and OpenBLAS each try to spawn as many threads as there are CPU cores, which
+# causes contention and can actually slow down inference on single-core hosts.
+os.environ["OMP_NUM_THREADS"]      = "1"   # OpenMP -- used by ONNX Runtime internals
+os.environ["OPENBLAS_NUM_THREADS"] = "1"   # OpenBLAS -- used by NumPy linear algebra ops
 
-# Directory where all intermediate debug images will be saved
-os.makedirs("debug_output", exist_ok=True)
+from fastapi import FastAPI, File, UploadFile, HTTPException
+import onnxruntime as ort
+import numpy as np
+from PIL import Image
+import cv2, io, asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+app = FastAPI()
+
+# Thread pool used to run the synchronous inference pipeline (_infer) without
+# blocking the async event loop. max_workers=3 allows up to 3 concurrent
+# inference requests; requests beyond that queue automatically.
+_executor = ThreadPoolExecutor(max_workers=3)
+
 
 # ---------------------------------------------------------------------------
-# Blur score thresholds (computed using Laplacian variance).
-# Higher score = sharper image; lower score = blurrier image.
+# Model loading (runs once at startup, not per request)
 # ---------------------------------------------------------------------------
-BLUR_REJECT  = 5    # Images scoring below this are too blurry to recover; reject them outright
-BLUR_SHARPEN = 50   # Images scoring between BLUR_REJECT and this are mildly blurry; apply sharpening
-                    # Images scoring above BLUR_SHARPEN are already sharp enough; skip sharpening
+
+print("Loading ONNX model...")
+
+# Configure ONNX Runtime session options before loading the model.
+# These settings are applied once and reused for every inference call.
+opts = ort.SessionOptions()
+opts.intra_op_num_threads     = 1                                          # Threads within a single op (e.g. matrix multiply)
+opts.inter_op_num_threads     = 1                                          # Threads across parallel ops in the graph
+opts.execution_mode           = ort.ExecutionMode.ORT_SEQUENTIAL           # Run ops sequentially; avoids thread overhead on small models
+opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL  # Apply all graph-level optimizations at load time
+
+# Load the ONNX model into an inference session.
+# CPUExecutionProvider is specified explicitly to avoid ONNX Runtime attempting
+# to use CUDA or other accelerators that are not present in this environment.
+session     = ort.InferenceSession("model.onnx", sess_options=opts, providers=["CPUExecutionProvider"])
+INPUT_NAME  = session.get_inputs()[0].name    # Name of the model's input tensor (e.g. "input")
+OUTPUT_NAME = session.get_outputs()[0].name   # Name of the model's output tensor (e.g. "dense")
+
+print("Model ready.")
+
+# Ordered list of class labels corresponding to the model's output indices.
+# Index 0 = Healthy Leaf, Index 1 = Powdery Mildew, etc.
+# Must match the label ordering used during model training exactly.
+CLASSES = ["Healthy Leaf", "Powdery Mildew", "Downy Mildew", "Rust", "Leaf Spot"]
 
 
-def validate(img_array):
+# ---------------------------------------------------------------------------
+# Stage 1: Image quality and leaf presence validation
+# ---------------------------------------------------------------------------
+
+def validate(img_array: np.ndarray) -> dict:
     """
-    Validates the quality of an input image before processing.
+    Checks whether the image is suitable for inference.
 
-    Checks performed:
-        - Blur: Uses the variance of the Laplacian to detect blurriness.
-                A low variance means the image lacks sharp edges (blurry).
-        - Brightness: Measures average pixel intensity on the grayscale image.
-                      Very dark or overexposed images are rejected.
-        - Leaf presence: Uses HSV color masking to check whether the image
-                         contains enough green/plant-colored content to be
-                         considered a valid leaf photo.
+    Three quality checks are performed:
+        - Blur:       Laplacian variance measures edge sharpness.
+                      A low value means the image lacks detail (too blurry).
+        - Brightness: Mean grayscale intensity. Catches images that are
+                      too dark (sensor noise, no lighting) or overexposed
+                      (completely washed out, no visible features).
+        - Leaf presence: HSV color masks detect whether plant-colored pixels
+                      exist. Rejects non-leaf uploads (blank photos, objects).
 
     Parameters:
         img_array (np.ndarray): Input image as an RGB NumPy array.
 
     Returns:
-        dict: A result dictionary containing:
-              - 'valid' (bool): Whether the image passed all checks.
-              - 'reason' (str): Rejection reason if valid=False.
-              - 'blur_score' (float): Laplacian variance score.
-              - 'needs_sharpen' (bool): True if blur score is between thresholds.
-              - 'brightness' (float): Mean grayscale pixel intensity (0-255).
-              - 'leaf_coverage' (float): Fraction of pixels identified as leaf/plant.
+        dict: Contains 'valid' (bool) and either 'reason' (str) on failure,
+              or 'blur_score', 'brightness', 'leaf_coverage' (float) on success.
     """
-    # Convert to grayscale for blur and brightness checks
+    # Convert to grayscale -- blur and brightness checks operate on intensity only
     gray       = cv2.cvtColor(img_array, cv2.COLOR_RGB2GRAY)
+    blur       = cv2.Laplacian(gray, cv2.CV_64F).var()   # High = sharp, low = blurry
+    brightness = float(gray.mean())                       # Range: 0 (black) to 255 (white)
 
-    # Laplacian variance: high = sharp edges present, low = blurry
-    blur       = cv2.Laplacian(gray, cv2.CV_64F).var()
-
-    # Mean intensity: 0 = black, 255 = white
-    brightness = float(gray.mean())
-
-    # Reject images that are too blurry to be useful
-    if blur < BLUR_REJECT:
+    if blur < 5:
         return {"valid": False, "reason": "Image is too blurry. Please upload a clearer photo."}
-
-    # Reject images that are too dark (likely unlit or underexposed)
     if brightness < 10:
         return {"valid": False, "reason": "Image is too dark. Please upload a well-lit photo."}
-
-    # Reject images that are overexposed (washed out, no usable detail)
     if brightness > 250:
         return {"valid": False, "reason": "Image is overexposed. Please upload a better photo."}
 
-    # Convert to HSV for color-based leaf detection
+    # Convert to HSV for color-based leaf detection.
+    # HSV separates hue (color type) from saturation and brightness, making
+    # color range thresholds more robust to lighting variation than RGB.
     hsv     = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
-
-    # Separate the R, G, B channels for green-dominance check
     r, g, b = img_array[:,:,0], img_array[:,:,1], img_array[:,:,2]
     total   = img_array.shape[0] * img_array.shape[1]
 
-    # Ratio of pixels where green channel dominates both red and blue
+    # Fraction of pixels where the green channel is brighter than both red and blue.
+    # A healthy leaf typically has a high proportion of such pixels.
     g_ratio = float(np.sum((g > r) & (g > b)) / total)
 
-    # Define HSV masks for various plant-related colors:
-    #   - Green hues (leaf body)
-    #   - Yellow-green / olive tones (aged or diseased areas)
-    #   - Dark red-orange hues (disease spots or edges)
-    #   - Wraparound reds in HSV (hue near 0 and 180 both represent red)
+    # HSV masks covering the full range of leaf colors:
+    #   green  -- healthy and mildly diseased tissue
+    #   brown  -- aged or heavily infected tissue
+    #   red1/2 -- rust disease; HSV hue wraps around at 0/180 so two ranges are needed
     masks = [
-        cv2.inRange(hsv, np.array([10, 10, 10]), np.array([110, 255, 255])),  # Green range
-        cv2.inRange(hsv, np.array([3,  10, 10]), np.array([30,  255, 230])),  # Yellow-green
-        cv2.inRange(hsv, np.array([0,  10, 10]), np.array([3,   255, 230])),  # Low-hue red
-        cv2.inRange(hsv, np.array([170,10, 10]), np.array([180, 255, 230])),  # High-hue red wrap
+        cv2.inRange(hsv, np.array([10, 10, 10]), np.array([110, 255, 255])),  # green
+        cv2.inRange(hsv, np.array([3,  10, 10]), np.array([30,  255, 230])),  # brown
+        cv2.inRange(hsv, np.array([0,  10, 10]), np.array([3,   255, 230])),  # red1
+        cv2.inRange(hsv, np.array([170,10, 10]), np.array([180, 255, 230])),  # red2
     ]
-
-    # Merge all masks into a single combined mask
     combined = masks[0]
     for m in masks[1:]:
         combined = cv2.bitwise_or(combined, m)
 
-    # Fraction of pixels matching any plant-like color
+    # Fraction of total pixels that matched any plant-like color
     coverage = float(np.sum(combined > 0) / total)
 
-    # Reject if neither green-dominant pixels nor plant-colored pixels are found
+    # Reject if neither the green-dominance check nor the color coverage check
+    # finds enough plant-colored content -- likely not a leaf photo
     if g_ratio < 0.03 and coverage < 0.03:
-        return {"valid": False, "reason": "No leaf detected."}
+        return {"valid": False, "reason": "No leaf detected. Please upload a clear photo of a plant leaf."}
 
     return {
         "valid":         True,
         "blur_score":    round(blur, 2),
-        "needs_sharpen": blur < BLUR_SHARPEN,  # Flag for the sharpening stage
         "brightness":    round(brightness, 2),
         "leaf_coverage": round(coverage, 2),
     }
 
 
-def sharpen_image(img_array: np.ndarray) -> np.ndarray:
-    """
-    Sharpens a mildly blurry image using the Unsharp Masking technique.
-
-    How it works:
-        1. A slightly blurred version of the image is created using a Gaussian blur.
-        2. The difference between the original and the blurred version is the
-           high-frequency detail (edges and textures).
-        3. That detail is added back to the original at a weighted strength,
-           effectively amplifying the edges and making the image appear sharper.
-
-    This method preserves color fidelity because it sharpens based on
-    luminance contrast rather than shifting hue or saturation values.
-
-    Parameters:
-        img_array (np.ndarray): Input image as an RGB NumPy array.
-
-    Returns:
-        np.ndarray: Sharpened image as an RGB NumPy array.
-    """
-    # Create a blurred version to extract the low-frequency (soft) component
-    blurred = cv2.GaussianBlur(img_array, (0, 0), sigmaX=2)
-
-    # Blend: 1.5x original minus 0.5x blurred = original + 0.5x (original - blurred)
-    # This adds high-frequency edge detail back on top of the image
-    sharpened = cv2.addWeighted(img_array, 1.5, blurred, -0.5, 0)
-
-    return sharpened
-
+# ---------------------------------------------------------------------------
+# Stage 2: Background removal
+#
+# Isolates the leaf from its background using HSV color masking and
+# morphological operations, then replaces the background with white.
+#
+# Steps:
+#   1. Build a leaf mask using wide HSV ranges (covers all disease states)
+#   2. Morphological close -- fills holes inside the leaf (disease spots, veins)
+#   3. Dilate then erode -- recovers missed leaf-edge pixels, smooths mask border
+#   4. Keep only the largest contour -- drops stray background noise blobs
+#   5. Composite onto a white canvas -- background becomes white, leaf unchanged
+# ---------------------------------------------------------------------------
 
 def remove_background(img_array: np.ndarray) -> np.ndarray:
     """
-    Isolates the leaf from the background by creating a color-based mask.
-
-    Process:
-        1. Converts the image to HSV color space for robust color segmentation.
-        2. Builds masks for green and plant-adjacent colors to identify the leaf.
-        3. Applies morphological operations to fill gaps and smooth the mask edges.
-        4. Keeps only the largest detected contour (the main leaf body).
-        5. Fills non-leaf pixels with white (255, 255, 255) to produce a clean,
-           white-background image suitable for model input.
+    Removes the image background and replaces it with white pixels.
 
     Parameters:
         img_array (np.ndarray): Input image as an RGB NumPy array.
 
     Returns:
-        np.ndarray: Image with background replaced by white pixels.
+        np.ndarray: Image with background replaced by white (255, 255, 255).
     """
-    # Convert to HSV for color-based leaf segmentation
     hsv = cv2.cvtColor(img_array, cv2.COLOR_RGB2HSV)
 
-    # Build color masks for leaf/plant pixels (same color ranges as validation)
+    # Wide HSV ranges to capture all leaf states: healthy, diseased, aged
     masks = [
-        cv2.inRange(hsv, np.array([10, 15, 15]), np.array([110, 255, 255])),  # Green
-        cv2.inRange(hsv, np.array([3,  15, 15]), np.array([30,  255, 220])),  # Yellow-green
-        cv2.inRange(hsv, np.array([0,  15, 15]), np.array([3,   255, 220])),  # Low-hue red
-        cv2.inRange(hsv, np.array([170,15, 15]), np.array([180, 255, 220])),  # High-hue red wrap
+        cv2.inRange(hsv, np.array([10, 15, 15]), np.array([110, 255, 255])),  # green/yellow
+        cv2.inRange(hsv, np.array([3,  15, 15]), np.array([30,  255, 220])),  # brown
+        cv2.inRange(hsv, np.array([0,  15, 15]), np.array([3,   255, 220])),  # red1
+        cv2.inRange(hsv, np.array([170,15, 15]), np.array([180, 255, 220])),  # red2
     ]
-
-    # Combine all masks into one unified leaf mask
     mask = masks[0]
     for m in masks[1:]:
         mask = cv2.bitwise_or(mask, m)
 
-    # Morphological closing: fills small gaps and holes within the leaf region
-    # A large elliptical kernel (20x20) ensures broad gap-filling
+    # Morphological close: fills internal holes (disease spots, leaf veins, shadows).
+    # A 20x20 elliptical kernel is large enough to bridge most gaps inside a leaf.
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
     mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
 
-    # Dilation followed by erosion (a mild open/close cycle) to smooth mask edges
-    # and recover any leaf pixels missed by the initial color mask
+    # Dilate then erode: recovers leaf-edge pixels the HSV mask may have missed,
+    # then pulls the border back in to avoid including too much background.
     kernel_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (10, 10))
     mask         = cv2.dilate(mask, kernel_small, iterations=2)
     mask         = cv2.erode(mask,  kernel_small, iterations=1)
 
-    # Find external contours in the mask; keep only the largest one (the main leaf)
-    # This discards small isolated blobs from the background or noise
+    # Retain only the largest connected contour (the main leaf body).
+    # This discards small isolated blobs caused by background colors that
+    # fall within the leaf HSV range (e.g. green grass, brown soil patches).
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if contours:
         clean_mask = np.zeros_like(mask)
@@ -206,31 +198,33 @@ def remove_background(img_array: np.ndarray) -> np.ndarray:
         cv2.drawContours(clean_mask, [largest], -1, 255, thickness=cv2.FILLED)
         mask = clean_mask
 
-    # Start with an all-white canvas the same size as the input image
-    result = np.full_like(img_array, 255)
-
-    # Copy leaf pixels from the original; background pixels remain white
-    result[mask > 0] = img_array[mask > 0]
+    # Composite: start with an all-white canvas, then paste leaf pixels on top.
+    # White background is neutral and matches the training data preprocessing.
+    result           = np.full_like(img_array, 255)   # white canvas
+    result[mask > 0] = img_array[mask > 0]            # overlay leaf pixels
 
     return result
 
 
+# ---------------------------------------------------------------------------
+# Stage 3: Noise reduction
+# ---------------------------------------------------------------------------
+
 def remove_noise(img_array: np.ndarray) -> np.ndarray:
     """
-    Reduces noise in the image using a bilateral filter.
+    Reduces image noise using a bilateral filter.
 
-    A bilateral filter smooths the image while preserving edges, unlike a
-    simple Gaussian blur which blurs edges as well. It considers both the
-    spatial distance between pixels and the difference in their color values,
-    so pixels that are spatially close AND similarly colored get blended,
-    while pixels across sharp edges (different colors) are left distinct.
+    A bilateral filter smooths regions of similar color while preserving
+    sharp edges, unlike a Gaussian blur which blurs edges indiscriminately.
+    It considers both spatial proximity and color similarity between pixels.
 
     Parameters used:
-        d=5         : Diameter of each pixel's neighborhood for filtering
-        sigmaColor=30 : Color tolerance — how different colors can be and still
-                        be blended together (lower = more edge-preserving)
-        sigmaSpace=30 : Spatial tolerance — how far apart pixels can be and
-                        still influence each other
+        d=5           -- Neighborhood diameter; small enough for speed, large
+                         enough to catch sensor noise clusters
+        sigmaColor=30 -- Low color tolerance: only blends pixels with very
+                         similar colors, so leaf color detail is preserved exactly
+        sigmaSpace=30 -- Spatial tolerance: how far apart two pixels can be
+                         and still influence each other
 
     Parameters:
         img_array (np.ndarray): Input image as an RGB NumPy array.
@@ -241,133 +235,119 @@ def remove_noise(img_array: np.ndarray) -> np.ndarray:
     return cv2.bilateralFilter(img_array, d=5, sigmaColor=30, sigmaSpace=30)
 
 
-# =============================================================================
-# MAIN PIPELINE — runs each preprocessing stage in order and saves debug images
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Full inference pipeline (synchronous -- runs in thread pool)
+# ---------------------------------------------------------------------------
 
-print("=" * 50)
-print("  PREPROCESSING DEBUG -- exact main.py pipeline")
-print("=" * 50)
+def _infer(image_bytes: bytes) -> dict:
+    """
+    Runs the complete preprocessing and inference pipeline on raw image bytes.
+
+    This function is synchronous and CPU-bound. It is called via
+    asyncio's run_in_executor so it does not block the async event loop.
+
+    Pipeline stages:
+        1. Decode image bytes to an RGB NumPy array
+        2. Validate image quality and leaf presence
+        3. Remove background
+        4. Remove noise
+        5. Resize to 256x256 and normalize pixel values to [0.0, 1.0]
+        6. Run ONNX model inference; return top class and confidence score
+
+    Parameters:
+        image_bytes (bytes): Raw bytes of the uploaded image file.
+
+    Returns:
+        dict: Contains 'disease' (str), 'confidence' (float), and
+              'image_quality' metrics (blur_score, brightness, leaf_coverage).
+
+    Raises:
+        HTTPException 400: If the image cannot be decoded, fails validation,
+                           or does not contain a detectable leaf.
+    """
+    # Decode the raw bytes into a PIL image and convert to RGB NumPy array.
+    # io.BytesIO wraps the bytes so PIL can treat them as a file-like object.
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except Exception:
+        raise HTTPException(400, "Invalid image file. Please upload a JPG or PNG.")
+
+    arr = np.array(img)
+
+    # Stage 1: Validate blur, brightness, and leaf presence
+    quality = validate(arr)
+    if not quality["valid"]:
+        raise HTTPException(400, quality["reason"])
+
+    # Stage 2: Remove background using HSV masking and morphological cleanup
+    arr = remove_background(arr)
+
+    # Stage 3: Reduce noise with a color-preserving bilateral filter
+    arr = remove_noise(arr)
+
+    # Stage 4: Resize to the model's expected input resolution (256x256).
+    # LANCZOS resampling provides high-quality downscaling with minimal aliasing.
+    # Normalize pixel values from [0, 255] to [0.0, 1.0] to match training preprocessing.
+    img = Image.fromarray(arr).resize((256, 256), Image.LANCZOS)
+    arr = np.array(img, dtype=np.float32) / 255.0
+
+    # Add a batch dimension: shape becomes (1, 256, 256, 3).
+    # The model expects a batch of images, not a single image tensor.
+    inp = np.expand_dims(arr, axis=0)
+
+    # Stage 5: Run ONNX inference.
+    # session.run returns a list of output arrays; [0] gets the first (and only) output.
+    # out shape: (1, num_classes) -- one score per class per image in the batch.
+    out  = session.run([OUTPUT_NAME], {INPUT_NAME: inp})[0]
+    cls  = int(np.argmax(out))    # Index of the highest-scoring class
+    conf = float(np.max(out))     # Score of the top class (used as confidence)
+
+    return {
+        "disease":    CLASSES[cls],
+        "confidence": round(conf, 4),
+        "image_quality": {
+            "blur_score":    quality["blur_score"],
+            "brightness":    quality["brightness"],
+            "leaf_coverage": quality["leaf_coverage"],
+        },
+    }
+
 
 # ---------------------------------------------------------------------------
-# Stage 1: Load the original image
+# API routes
 # ---------------------------------------------------------------------------
-img = Image.open(IMAGE_PATH).convert("RGB")
-arr = np.array(img)
 
-# Save the unmodified original for reference
-Image.fromarray(arr).save("debug_output/stage1_original.jpg")
-print(f"\nStage 1 -- Original loaded: {img.size}")
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    """
+    Accepts a leaf image upload and returns a disease classification.
 
-# ---------------------------------------------------------------------------
-# Stage 2: Validate image quality
-# ---------------------------------------------------------------------------
-quality = validate(arr)
+    Validates file type and size before passing bytes to the inference pipeline.
+    The synchronous _infer function is offloaded to a thread pool executor to
+    avoid blocking the async event loop during CPU-intensive preprocessing.
 
-status_label = "PASS" if quality["valid"] else "FAIL"
-print(f"\nStage 2 -- Validation: {status_label}")
-print(f"   blur={quality.get('blur_score')}  brightness={quality.get('brightness')}  leaf_coverage={quality.get('leaf_coverage')}")
-print(f"   needs_sharpen={quality.get('needs_sharpen')}  (threshold: {BLUR_REJECT} reject / {BLUR_SHARPEN} sharpen)")
+    Returns:
+        JSON with 'disease', 'confidence', and 'image_quality' fields.
+    """
+    # Reject non-image uploads before reading the full file contents
+    if file.content_type not in ("image/jpeg", "image/png", "image/jpg"):
+        raise HTTPException(400, "Invalid file type. Please upload a JPG or PNG.")
 
-# Stop the pipeline entirely if the image does not meet quality requirements
-if not quality["valid"]:
-    print(f"   REJECTED: {quality['reason']}")
-    exit()
+    data = await file.read()
 
-# ---------------------------------------------------------------------------
-# Stage 3: Sharpening (only if the image is mildly blurry)
-# ---------------------------------------------------------------------------
-if quality.get("needs_sharpen"):
-    arr = sharpen_image(arr)
-    Image.fromarray(arr).save("debug_output/stage3_sharpened.jpg")
+    # Enforce a 10MB size cap to prevent memory spikes from oversized uploads
+    if len(data) > 10 * 1024 * 1024:
+        raise HTTPException(400, "Image too large. Max 10MB.")
 
-    # Re-measure blur after sharpening to confirm the improvement
-    gray_after = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
-    blur_after = cv2.Laplacian(gray_after, cv2.CV_64F).var()
+    # Run the blocking inference pipeline in a background thread so the event
+    # loop remains free to accept other incoming requests during processing
+    return await asyncio.get_event_loop().run_in_executor(_executor, _infer, data)
 
-    print(f"\nStage 3 -- Sharpening applied")
-    print(f"   blur before: {quality['blur_score']}  ->  blur after: {round(blur_after, 2)}")
-    print(f"   Saved: debug_output/stage3_sharpened.jpg")
-else:
-    print(f"\nStage 3 -- Skipped (image already sharp, blur={quality['blur_score']})")
 
-# ---------------------------------------------------------------------------
-# Stage 4: Background removal
-# ---------------------------------------------------------------------------
-arr_bg = remove_background(arr)
-Image.fromarray(arr_bg).save("debug_output/stage4_bg_removed.jpg")
-
-# Generate a semi-transparent mask overlay for visual debugging.
-# This shows which pixels were identified as leaf (highlighted in green).
-hsv = cv2.cvtColor(arr, cv2.COLOR_RGB2HSV)
-masks = [
-    cv2.inRange(hsv, np.array([10, 15, 15]), np.array([110, 255, 255])),
-    cv2.inRange(hsv, np.array([3,  15, 15]), np.array([30,  255, 220])),
-    cv2.inRange(hsv, np.array([0,  15, 15]), np.array([3,   255, 220])),
-    cv2.inRange(hsv, np.array([170,15, 15]), np.array([180, 255, 220])),
-]
-mask = masks[0]
-for m in masks[1:]:
-    mask = cv2.bitwise_or(mask, m)
-
-# Close gaps in the debug mask (same operation as in remove_background)
-kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (20, 20))
-mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-
-# Create a green-tinted layer to represent the detected leaf area
-mask_rgb           = np.zeros_like(arr)
-mask_rgb[mask > 0] = [0, 200, 0]
-
-# Blend the original image with the green mask layer at 40% transparency
-overlay = Image.blend(
-    Image.fromarray(arr),
-    Image.fromarray(mask_rgb.astype(np.uint8)),
-    alpha=0.4
-)
-overlay.save("debug_output/stage4_mask_overlay.jpg")
-
-print(f"\nStage 4 -- Background removed")
-print(f"   Saved: debug_output/stage4_bg_removed.jpg")
-print(f"   Saved: debug_output/stage4_mask_overlay.jpg")
-
-# ---------------------------------------------------------------------------
-# Stage 5: Noise reduction
-# ---------------------------------------------------------------------------
-arr_denoised = remove_noise(arr_bg)
-Image.fromarray(arr_denoised).save("debug_output/stage5_denoised.jpg")
-print(f"\nStage 5 -- Noise reduction done")
-print(f"   Saved: debug_output/stage5_denoised.jpg")
-
-# ---------------------------------------------------------------------------
-# Stage 6: Resize and normalize for model input
-# ---------------------------------------------------------------------------
-# Resize to the model's expected input resolution (256x256)
-final_img = Image.fromarray(arr_denoised).resize((256, 256), Image.LANCZOS)
-
-# Normalize pixel values from [0, 255] to [0.0, 1.0] (float32)
-arr_norm = np.array(final_img, dtype=np.float32) / 255.0
-
-# Save a uint8 version (scaled back to 0-255) for visual inspection
-Image.fromarray((arr_norm * 255).astype(np.uint8)).save("debug_output/stage6_final.jpg")
-
-print(f"\nStage 6 -- Final model input ready")
-print(f"   shape={arr_norm.shape}  min={arr_norm.min():.3f}  max={arr_norm.max():.3f}  mean={arr_norm.mean():.3f}")
-
-# ---------------------------------------------------------------------------
-# Open all saved debug images for visual inspection
-# ---------------------------------------------------------------------------
-print("\nOpening all debug images...")
-
-# Always show original and post-background-removal stages
-images_to_open = ["stage1_original"]
-
-# Only show the sharpened image if sharpening was actually applied
-if quality.get("needs_sharpen"):
-    images_to_open.append("stage3_sharpened")
-
-images_to_open += ["stage4_mask_overlay", "stage4_bg_removed", "stage5_denoised", "stage6_final"]
-
-for f in images_to_open:
-    Image.open(f"debug_output/{f}.jpg").show()
-
-print("\nAll debug images saved to debug_output/")
+@app.get("/ping")
+def ping():
+    """
+    Health check endpoint. Returns a static response to confirm the server is running.
+    Used by Render and other platforms to verify the container started successfully.
+    """
+    return {"message": "server is alive"}
